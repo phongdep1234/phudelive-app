@@ -7,7 +7,7 @@
 //   • phụ đề tiếng Việt có sẵn trên SubDL (đã giải nén, sửa bảng mã, đổi sang SRT UTF-8)
 //   • phụ đề "dịch máy" Anh → Việt từ phụ đề tiếng Anh tốt nhất trên SubDL
 
-const VERSION = '2.0.0';
+const VERSION = '2.0.1';
 const MAX_VI = 6;       // số phụ đề Việt có sẵn tối đa
 const MAX_TR = 2;       // số phụ đề dịch máy tối đa
 const CHUNK = 4000;     // số ký tự mỗi lần gửi Google Dịch
@@ -60,7 +60,8 @@ async function cached(request, ctx, make, maxAge) {
   const key = new Request(new URL(request.url).toString(), { method: 'GET' });
   if (cache) { const hit = await cache.match(key); if (hit) return hit; }
   const res = await make();
-  if (cache && res.status === 200) {
+  const noStore = /max-age=0/.test(res.headers.get('Cache-Control') || '');
+  if (cache && res.status === 200 && !noStore) {
     const copy = new Response(res.clone().body, res);
     copy.headers.set('Cache-Control', `public, max-age=${maxAge}`);
     ctx && ctx.waitUntil ? ctx.waitUntil(cache.put(key, copy)) : await cache.put(key, copy);
@@ -97,8 +98,9 @@ async function listSubs(url, env, type, id, extraStr) {
   if (season) q.set('season_number', String(season));
   if (episode) q.set('episode_number', String(episode));
   const r = await fetch('https://api.subdl.com/api/v1/subtitles?' + q, { headers: { Accept: 'application/json' } });
-  if (!r.ok) return json({ subtitles: [] });
+  if (!r.ok) return json({ subtitles: [], err: 'SubDL lỗi ' + r.status });
   const data = await r.json().catch(() => ({}));
+  if (data && data.status === false) return json({ subtitles: [], err: 'SubDL: ' + (data.error || data.message || 'lỗi') });
   const subs = (data && data.subtitles) || [];
 
   const isVi = s => /viet/i.test(s.lang || '') || /^vi$/i.test(s.language || '');
