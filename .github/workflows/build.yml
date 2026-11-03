@@ -1,0 +1,24 @@
+name: Build DMG
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Chọn Xcode mới nhất
+        run: |
+          ls /Applications | grep -i xcode || true
+          X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$X" ]; then sudo xcode-select -s "$X"; fi
+          xcodebuild -version
+          swift --version
+      - name: Build
+        run: bash scripts/build_app.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PhuDeVietLive-dmg
+          path: dist/PhuDeVietLive.dmg
