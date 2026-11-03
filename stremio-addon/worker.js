@@ -1,13 +1,14 @@
 // Phụ đề Việt — add-on phụ đề tiếng Việt cho Stremio (Mac, iPhone, Android, TV)
 // Chạy trên Cloudflare Workers.
-//   Secret bắt buộc : SUBDL_KEY  (API key của SubDL)
+//   Không cần key nào. Nguồn chính: OpenSubtitles (qua máy chủ của Stremio, miễn phí).
+//   Secret tuỳ chọn : SUBDL_KEY  (thêm nguồn SubDL, cũng miễn phí)
 //   Binding tuỳ chọn: AI         (Workers AI, dùng dự phòng khi Google Dịch lỗi)
 //
 // Mỗi phim trả về:
-//   • phụ đề tiếng Việt có sẵn trên SubDL (đã giải nén, sửa bảng mã, đổi sang SRT UTF-8)
-//   • phụ đề "dịch máy" Anh → Việt từ phụ đề tiếng Anh tốt nhất trên SubDL
+//   • phụ đề tiếng Việt có sẵn (OpenSubtitles, SubDL) — đã sửa bảng mã, SRT UTF-8
+//   • phụ đề "dịch máy" Anh → Việt từ phụ đề tiếng Anh khớp nhất
 
-const VERSION = '2.0.1';
+const VERSION = '2.1.0';
 const MAX_VI = 6;       // số phụ đề Việt có sẵn tối đa
 const MAX_TR = 2;       // số phụ đề dịch máy tối đa
 const CHUNK = 4000;     // số ký tự mỗi lần gửi Google Dịch
@@ -16,7 +17,7 @@ const MANIFEST = {
   id: 'com.thayphong.phudeviet',
   version: VERSION,
   name: 'Phụ đề Việt',
-  description: 'Phụ đề tiếng Việt từ SubDL + phụ đề tự dịch Anh → Việt khi phim chưa có bản Việt.',
+  description: 'Phụ đề tiếng Việt từ OpenSubtitles và SubDL + phụ đề tự dịch Anh → Việt.',
   logo: 'https://flagcdn.com/w160/vn.png',
   resources: ['subtitles'],
   types: ['movie', 'series'],
@@ -46,8 +47,8 @@ export default {
       if (p === '/manifest.json') return json(MANIFEST, 3600);
       let m = p.match(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\/([^/]*))?\.json$/);
       if (m) return await cached(request, ctx, () => listSubs(url, env, m[1], decodeURIComponent(m[2]), m[3] || ''), 6 * 3600);
-      m = p.match(/^\/sub\/(vi|tr)\/([A-Za-z0-9_-]+)\/(\d+)\/(\d+)\/[^/]+\.srt$/);
-      if (m) return await cached(request, ctx, () => serveSub(env, m[1], b64d(m[2]), +m[3], +m[4]), 30 * 86400);
+      m = p.match(/^\/sub\/(vi|tr)\/(os|sd)\/([A-Za-z0-9_-]+)\/(\d+)\/(\d+)\/[^/]+\.srt$/);
+      if (m) return await cached(request, ctx, () => serveSub(env, m[1], m[2], b64d(m[3]), +m[4], +m[5]), 30 * 86400);
       return new Response('Not found', { status: 404, headers: CORS });
     } catch (e) {
       return new Response('Lỗi: ' + (e && e.message || e), { status: 500, headers: CORS });
@@ -85,12 +86,62 @@ function home(url) {
 
 // ---------------------------------------------------------------- danh sách phụ đề
 async function listSubs(url, env, type, id, extraStr) {
-  if (!env.SUBDL_KEY) return json({ subtitles: [], err: 'Thiếu SUBDL_KEY' });
   const [imdb, sStr, eStr] = id.split(':');
   const season = +sStr || 0, episode = +eStr || 0;
   const extra = Object.fromEntries(new URLSearchParams(extraStr));
   const filename = (extra.filename || '').toLowerCase();
+  const toks = new Set(filename.split(/[^a-z0-9]+/).filter(t => t.length > 1));
+  const match = name => {
+    let sc = 0;
+    for (const t of (name || '').toLowerCase().split(/[^a-z0-9]+/)) if (toks.has(t)) sc += 1;
+    return sc;
+  };
 
+  const [os, sd] = await Promise.all([
+    fromOpenSubtitles(type, id, extraStr).catch(() => []),
+    env.SUBDL_KEY ? fromSubDL(env, type, imdb, season, episode).catch(() => []) : []
+  ]);
+  const all = [...os, ...sd];
+
+  const okEp = s => {
+    if (!season) return true;
+    if (s.season && s.season !== season) return false;
+    if (s.episode && episode && s.episode !== episode) return false;
+    return true;
+  };
+  const score = s => match(s.name) + (episode && s.episode === episode ? 5 : 0)
+    + (/\b(cam|ts|telesync|hdcam)\b/i.test(s.name || '') ? -3 : 0) + (s.src === 'os' ? 0.5 : 0);
+  const pick = (arr, n) => arr.filter(okEp).sort((a, b) => score(b) - score(a))
+    .filter((s, i, a) => a.findIndex(x => x.ref === s.ref) === i).slice(0, n);
+
+  const vi = pick(all.filter(s => s.lang === 'vi'), MAX_VI);
+  const en = pick(all.filter(s => s.lang === 'en'), MAX_TR);
+  const mk = (mode, s, i) => ({
+    id: `phudeviet-${mode}-${s.src}-${i}`,
+    url: `${url.origin}/sub/${mode}/${s.src}/${b64e(s.ref)}/${season}/${episode}/${mode === 'vi' ? 'vietsub' : 'dichmay'}.srt`,
+    lang: 'vie',
+    label: mode === 'vi' ? `Tiếng Việt – ${(s.name || '').slice(0, 60)}` : `Tiếng Việt (dịch máy) – ${(s.name || '').slice(0, 50)}`
+  });
+  const out = [...vi.map((s, i) => mk('vi', s, i)), ...en.map((s, i) => mk('tr', s, i))];
+  return json({ subtitles: out, cacheMaxAge: 6 * 3600 }, out.length ? 6 * 3600 : 0);
+}
+
+// OpenSubtitles qua máy chủ của Stremio: miễn phí, không cần key
+async function fromOpenSubtitles(type, id, extraStr) {
+  const u = `https://opensubtitles-v3.strem.io/subtitles/${type}/${encodeURIComponent(id)}${extraStr ? '/' + extraStr : ''}.json`;
+  const r = await fetch(u);
+  if (!r.ok) return [];
+  const d = await r.json();
+  return (d.subtitles || [])
+    .filter(s => (s.lang === 'vie' || s.lang === 'eng') && /^https:\/\/[\w.-]*strem\.io\//.test(s.url || ''))
+    .map(s => ({
+      src: 'os', ref: s.url, lang: s.lang === 'vie' ? 'vi' : 'en',
+      name: s.movieReleaseName || s.subtitleFileName || 'OpenSubtitles',
+      season: +s.season || 0, episode: +s.episode || 0
+    }));
+}
+
+async function fromSubDL(env, type, imdb, season, episode) {
   const q = new URLSearchParams({
     api_key: env.SUBDL_KEY, imdb_id: imdb, type: type === 'series' ? 'tv' : 'movie',
     languages: 'VI,EN', subs_per_page: '30'
@@ -98,57 +149,32 @@ async function listSubs(url, env, type, id, extraStr) {
   if (season) q.set('season_number', String(season));
   if (episode) q.set('episode_number', String(episode));
   const r = await fetch('https://api.subdl.com/api/v1/subtitles?' + q, { headers: { Accept: 'application/json' } });
-  if (!r.ok) return json({ subtitles: [], err: 'SubDL lỗi ' + r.status });
-  const data = await r.json().catch(() => ({}));
-  if (data && data.status === false) return json({ subtitles: [], err: 'SubDL: ' + (data.error || data.message || 'lỗi') });
-  const subs = (data && data.subtitles) || [];
-
-  const isVi = s => /viet/i.test(s.lang || '') || /^vi$/i.test(s.language || '');
-  const isEn = s => /^english$/i.test(s.lang || '') || /^en$/i.test(s.language || '');
-  const okEp = s => {
-    if (!season) return true;
-    const se = +s.season || 0, ep = +s.episode || 0;
-    if (se && se !== season) return false;
-    if (ep && episode && ep !== episode) return false;
-    return true;
-  };
-  const score = s => {
-    let sc = 0;
-    const rel = (s.release_name || s.name || '').toLowerCase();
-    if (filename) {
-      const toks = new Set(filename.split(/[^a-z0-9]+/).filter(t => t.length > 1));
-      for (const t of rel.split(/[^a-z0-9]+/)) if (toks.has(t)) sc += 1;
-    }
-    if (episode && +s.episode === episode) sc += 5;
-    if (s.hi) sc -= 1;
-    return sc;
-  };
-  const pick = (arr, n) => arr.filter(okEp).sort((a, b) => score(b) - score(a))
-    .filter((s, i, a) => a.findIndex(x => x.url === s.url) === i).slice(0, n);
-
-  const vi = pick(subs.filter(isVi), MAX_VI);
-  const en = pick(subs.filter(isEn), MAX_TR);
-  const base = url.origin;
-  const mk = (mode, s, i) => ({
-    id: `phudeviet-${mode}-${i}-${(s.url || '').replace(/\W+/g, '')}`,
-    url: `${base}/sub/${mode}/${b64e(s.url)}/${season}/${episode}/${mode === 'vi' ? 'vietsub' : 'dichmay'}.srt`,
-    lang: 'vie',
-    label: mode === 'vi' ? `Tiếng Việt – ${(s.release_name || s.author || 'SubDL').slice(0, 60)}` : `Tiếng Việt (dịch máy) – ${(s.release_name || '').slice(0, 50)}`
-  });
-  const out = [...vi.map((s, i) => mk('vi', s, i)), ...en.map((s, i) => mk('tr', s, i))];
-  return json({ subtitles: out, cacheMaxAge: 6 * 3600 }, 6 * 3600);
+  if (!r.ok) return [];
+  const d = await r.json();
+  return (d.subtitles || []).map(s => ({
+    src: 'sd', ref: s.url,
+    lang: (/viet/i.test(s.lang || '') || /^vi$/i.test(s.language || '')) ? 'vi'
+      : (/^english$/i.test(s.lang || '') || /^en$/i.test(s.language || '')) ? 'en' : '',
+    name: s.release_name || s.name || 'SubDL', season: +s.season || 0, episode: +s.episode || 0
+  })).filter(s => s.lang);
 }
 
 // ---------------------------------------------------------------- tải + xử lý 1 phụ đề
-async function serveSub(env, mode, path, season, episode) {
-  if (!/^\/subtitle\/[\w.\-]+$/.test(path)) return new Response('bad path', { status: 400, headers: CORS });
-  const r = await fetch('https://dl.subdl.com' + path);
+async function serveSub(env, mode, src, ref, season, episode) {
+  let dl;
+  if (src === 'sd' && /^\/subtitle\/[\w.\-]+$/.test(ref)) dl = 'https://dl.subdl.com' + ref;
+  else if (src === 'os' && /^https:\/\/[\w.-]*strem\.io\//.test(ref)) dl = ref;
+  else return new Response('bad path', { status: 400, headers: CORS });
+  const path = dl;
+  const r = await fetch(dl);
   if (!r.ok) return new Response('download ' + r.status, { status: 502, headers: CORS });
   const buf = new Uint8Array(await r.arrayBuffer());
 
   let files;
-  if (buf[0] === 0x50 && buf[1] === 0x4b) files = await unzip(buf);
-  else files = [{ name: path.split('/').pop(), data: buf }];
+  let data = buf;
+  if (data[0] === 0x1f && data[1] === 0x8b) data = await gunzip(data);
+  if (data[0] === 0x50 && data[1] === 0x4b) files = await unzip(data);
+  else files = [{ name: /\.(srt|ass|ssa|vtt)$/i.test(path) ? path.split('/').pop() : 'sub.srt', data }];
   files = files.filter(f => /\.(srt|ass|ssa|vtt|sub|txt)$/i.test(f.name));
   if (!files.length) return new Response('Không có file phụ đề trong gói', { status: 404, headers: CORS });
 
@@ -215,6 +241,11 @@ async function unzip(buf) {
 async function inflate(u8) {
   const ds = new DecompressionStream('deflate-raw');
   const res = new Response(new Blob([u8]).stream().pipeThrough(ds));
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+async function gunzip(u8) {
+  const res = new Response(new Blob([u8]).stream().pipeThrough(new DecompressionStream('gzip')));
   return new Uint8Array(await res.arrayBuffer());
 }
 
