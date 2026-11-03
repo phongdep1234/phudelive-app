@@ -8,7 +8,7 @@
 //   • phụ đề tiếng Việt có sẵn (OpenSubtitles, SubDL) — đã sửa bảng mã, SRT UTF-8
 //   • phụ đề "dịch máy" Anh → Việt từ phụ đề tiếng Anh khớp nhất
 
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 const MAX_VI = 6;       // số phụ đề Việt có sẵn tối đa
 const MAX_TR = 2;       // số phụ đề dịch máy tối đa
 const CHUNK = 4000;     // số ký tự mỗi lần gửi Google Dịch
@@ -45,6 +45,7 @@ export default {
     try {
       if (p === '/' || p === '') return home(url);
       if (p === '/manifest.json') return json(MANIFEST, 3600);
+      if (p === '/kiemtra') return json(await selfTest(env));
       let m = p.match(/^\/subtitles\/(movie|series)\/([^/]+?)(?:\/([^/]*))?\.json$/);
       if (m) return await cached(request, ctx, () => listSubs(url, env, m[1], decodeURIComponent(m[2]), m[3] || ''), 6 * 3600);
       m = p.match(/^\/sub\/(vi|tr)\/(os|sd)\/([A-Za-z0-9_-]+)\/(\d+)\/(\d+)\/[^/]+\.srt$/);
@@ -58,7 +59,8 @@ export default {
 
 async function cached(request, ctx, make, maxAge) {
   const cache = typeof caches !== 'undefined' ? caches.default : null;
-  const key = new Request(new URL(request.url).toString(), { method: 'GET' });
+  const ku = new URL(request.url); ku.searchParams.set('v', VERSION);
+  const key = new Request(ku.toString(), { method: 'GET' });
   if (cache) { const hit = await cache.match(key); if (hit) return hit; }
   const res = await make();
   const noStore = /max-age=0/.test(res.headers.get('Cache-Control') || '');
@@ -152,7 +154,7 @@ async function fromSubDL(env, type, imdb, season, episode) {
   if (!r.ok) return [];
   const d = await r.json();
   return (d.subtitles || []).map(s => ({
-    src: 'sd', ref: s.url,
+    src: 'sd', ref: String(s.url || '').split('?')[0],
     lang: (/viet/i.test(s.lang || '') || /^vi$/i.test(s.language || '')) ? 'vi'
       : (/^english$/i.test(s.lang || '') || /^en$/i.test(s.language || '')) ? 'en' : '',
     name: s.release_name || s.name || 'SubDL', season: +s.season || 0, episode: +s.episode || 0
@@ -183,9 +185,15 @@ async function serveSub(env, mode, src, ref, season, episode) {
   let cues = /\.(ass|ssa)$/i.test(f.name) || /^\s*\[Script Info\]/i.test(text) ? parseAss(text) : parseSrt(text);
   if (!cues.length) return new Response('Không đọc được phụ đề', { status: 422, headers: CORS });
 
-  if (mode === 'tr') cues = await translateCues(cues, env);
+  let ok = true;
+  if (mode === 'tr') {
+    const r = await translateCues(cues, env);
+    cues = r.cues;
+    ok = r.ratio >= 0.6;
+  }
   return new Response(toSrt(cues), {
-    headers: { ...CORS, 'Content-Type': 'application/x-subrip; charset=utf-8' }
+    headers: { ...CORS, 'Content-Type': 'application/x-subrip; charset=utf-8',
+      'Cache-Control': ok ? 'public, max-age=2592000' : 'max-age=0' }
   });
 }
 
@@ -356,29 +364,37 @@ async function translateCues(cues, env) {
     }
   }));
 
-  return cues.map((c, i) => {
+  const out = cues.map((c, i) => {
     const vi = map.get(src[i]);
     return { ...c, text: vi ? wrap(vi) : c.text };
   });
+  return { cues: out, ratio: uniq.length ? map.size / uniq.length : 1 };
 }
 
 async function translateChunk(lines, env, depth) {
-  try {
-    const out = await gtx(lines);
-    if (out.length === lines.length) return out;
-  } catch (e) { /* thử cách khác */ }
-  if (lines.length > 1 && depth < 3) {
+  for (const eng of [gtx, gtxGet, dictChrome]) {
+    try {
+      const out = await eng(lines);
+      if (out.length === lines.length && out.some(Boolean)) return out;
+    } catch (e) { /* thử cách khác */ }
+  }
+  if (lines.length > 1 && depth < 2) {
     const mid = Math.ceil(lines.length / 2);
     const [a, b] = await Promise.all([
       translateChunk(lines.slice(0, mid), env, depth + 1),
       translateChunk(lines.slice(mid), env, depth + 1)
     ]);
-    return a.concat(b);
+    if (a.some(Boolean) || b.some(Boolean)) return a.concat(b);
   }
   if (env.AI) {
     try {
+      const r = await env.AI.run('@cf/meta/m2m100-1.2b', { requests: lines.map(t => ({ text: t, source_lang: 'en', target_lang: 'vi' })) });
+      const arr = Array.isArray(r) ? r : (r && r.result) || [];
+      if (arr.length === lines.length) return arr.map(x => x && x.translated_text);
+    } catch (e) { /* thử từng câu */ }
+    try {
       return await Promise.all(lines.map(async t => {
-        const r = await env.AI.run('@cf/meta/m2m100-1.2b', { text: t, source_lang: 'english', target_lang: 'vietnamese' });
+        const r = await env.AI.run('@cf/meta/m2m100-1.2b', { text: t, source_lang: 'en', target_lang: 'vi' });
         return r && r.translated_text;
       }));
     } catch (e) { /* bỏ qua */ }
@@ -386,16 +402,50 @@ async function translateChunk(lines, env, depth) {
   return lines.map(() => null);
 }
 
+const UA = { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36' };
+
 async function gtx(lines) {
   const res = await fetch('https://translate.googleapis.com/translate_a/single?client=gtx&sl=en&tl=vi&dt=t', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 'User-Agent': 'Mozilla/5.0' },
+    method: 'POST', redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', ...UA },
     body: 'q=' + encodeURIComponent(lines.join('\n'))
   });
-  if (!res.ok) throw new Error('gtx ' + res.status);
+  if (res.status !== 200) throw new Error('gtx ' + res.status);
   const j = await res.json();
-  const txt = (j[0] || []).map(x => (x && x[0]) || '').join('');
-  return txt.split('\n').map(s => s.trim());
+  return (j[0] || []).map(x => (x && x[0]) || '').join('').split('\n').map(s => s.trim());
+}
+
+async function gtxGet(lines) {
+  const q = encodeURIComponent(lines.join('\n'));
+  if (q.length > 7000) throw new Error('too long');
+  const res = await fetch('https://translate.google.com/translate_a/single?client=gtx&sl=en&tl=vi&dt=t&q=' + q, { redirect: 'manual', headers: UA });
+  if (res.status !== 200) throw new Error('gtx2 ' + res.status);
+  const j = await res.json();
+  return (j[0] || []).map(x => (x && x[0]) || '').join('').split('\n').map(s => s.trim());
+}
+
+async function dictChrome(lines) {
+  const q = lines.map(t => 'q=' + encodeURIComponent(t)).join('&');
+  const res = await fetch('https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=en&tl=vi', {
+    method: 'POST', redirect: 'manual',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', ...UA }, body: q
+  });
+  if (res.status !== 200) throw new Error('dict ' + res.status);
+  const j = await res.json();
+  return (Array.isArray(j) ? j : []).map(x => Array.isArray(x) ? x[0] : x);
+}
+
+async function selfTest(env) {
+  const out = { version: VERSION, subdl_key: !!env.SUBDL_KEY, workers_ai: !!env.AI };
+  for (const [name, f] of [['google_1', gtx], ['google_2', gtxGet], ['google_3', dictChrome]]) {
+    try { out[name] = (await f(['Hello, how are you?', 'Where are you going tonight?'])).join(' | '); }
+    catch (e) { out[name] = 'LỖI: ' + e.message; }
+  }
+  if (env.AI) {
+    try { const r = await env.AI.run('@cf/meta/m2m100-1.2b', { text: 'Hello, how are you?', source_lang: 'en', target_lang: 'vi' }); out.workers_ai_test = r && r.translated_text; }
+    catch (e) { out.workers_ai_test = 'LỖI: ' + e.message; }
+  }
+  return out;
 }
 
 // Chia câu dài thành 2 dòng cho dễ đọc trên điện thoại
